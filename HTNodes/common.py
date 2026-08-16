@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from io import BytesIO
 
 import numpy as np
 import torch
@@ -19,6 +20,18 @@ except Exception:
     comfy_utils = None
 
 try:
+    import av
+except Exception:
+    av = None
+
+try:
+    import torchaudio
+    TORCHAUDIO_AVAILABLE = True
+except Exception:
+    torchaudio = None
+    TORCHAUDIO_AVAILABLE = False
+
+try:
     from comfy.cli_args import args
 except Exception:
     class _Args:
@@ -33,8 +46,21 @@ except Exception:
         STRING = "STRING"
         IMAGE = "IMAGE"
         LATENT = "LATENT"
+        AUDIO = "AUDIO"
+        VIDEO = "VIDEO"
 
     ComfyNodeABC = object
+
+try:
+    from comfy_api.latest import InputImpl, Types
+except Exception:
+    InputImpl = None
+    Types = None
+
+try:
+    from comfy_extras.nodes_audio import load as comfy_load_audio
+except Exception:
+    comfy_load_audio = None
 
 
 def normalize_path(path: str) -> str:
@@ -242,3 +268,175 @@ def build_latent_metadata(prompt=None, extra_pnginfo=None):
         for key, value in extra_pnginfo.items():
             metadata[key] = json.dumps(value)
     return metadata
+
+
+def load_audio_file(path: str) -> dict[str, Any]:
+    resolved = normalize_path(path)
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f"HTNodes: 音频文件不存在: {resolved}")
+
+    if comfy_load_audio is not None:
+        waveform, sample_rate = comfy_load_audio(resolved)
+    else:
+        if av is None:
+            raise RuntimeError("HTNodes: 当前环境无法导入 av，不能加载音频。")
+
+        with av.open(resolved) as container:
+            if not container.streams.audio:
+                raise ValueError("HTNodes: 文件中未找到音频流。")
+
+            stream = container.streams.audio[0]
+            sample_rate = stream.codec_context.sample_rate
+            channel_count = stream.channels
+
+            frames = []
+            for frame in container.decode(streams=stream.index):
+                buffer = torch.from_numpy(frame.to_ndarray())
+                if buffer.shape[0] != channel_count:
+                    buffer = buffer.view(-1, channel_count).t()
+                frames.append(buffer)
+
+            if not frames:
+                raise ValueError("HTNodes: 没有解码出任何音频帧。")
+
+            waveform = torch.cat(frames, dim=1)
+            if waveform.dtype.is_floating_point:
+                waveform = waveform.float()
+            elif waveform.dtype == torch.int16:
+                waveform = waveform.float() / (2 ** 15)
+            elif waveform.dtype == torch.int32:
+                waveform = waveform.float() / (2 ** 31)
+            else:
+                raise ValueError(f"HTNodes: 不支持的音频数据类型: {waveform.dtype}")
+
+    return {"waveform": waveform.unsqueeze(0), "sample_rate": int(sample_rate)}
+
+
+def load_video_file(path: str):
+    resolved = normalize_path(path)
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f"HTNodes: 视频文件不存在: {resolved}")
+    if InputImpl is None:
+        raise RuntimeError("HTNodes: 当前环境无法导入 comfy_api.latest.InputImpl，不能加载视频。")
+    return InputImpl.VideoFromFile(resolved)
+
+
+def build_video_metadata(prompt=None, extra_pnginfo=None):
+    if args.disable_metadata:
+        return None
+
+    metadata = {}
+    if extra_pnginfo is not None:
+        metadata.update(extra_pnginfo)
+    if prompt is not None:
+        metadata["prompt"] = prompt
+    return metadata or None
+
+
+def save_audio_file(
+    waveform: torch.Tensor,
+    sample_rate: int,
+    full_path: str,
+    file_format: str,
+    quality: str | None,
+    prompt=None,
+    extra_pnginfo=None,
+) -> None:
+    if av is None:
+        raise RuntimeError("HTNodes: 当前环境无法导入 av，不能保存音频。")
+
+    metadata = {}
+    if not args.disable_metadata:
+        if prompt is not None:
+            metadata["prompt"] = json.dumps(prompt)
+        if extra_pnginfo is not None:
+            for key, value in extra_pnginfo.items():
+                metadata[key] = json.dumps(value)
+
+    if waveform is None or not isinstance(waveform, torch.Tensor):
+        raise ValueError("HTNodes: 输入音频 waveform 无效。")
+    if sample_rate <= 0:
+        raise ValueError("HTNodes: 音频输入缺少有效的 sample_rate。")
+    waveform = waveform.detach().cpu()
+    if waveform.ndim != 2:
+        raise ValueError("HTNodes: 音频 waveform 形状必须为 [C, T]。")
+
+    target_rate = sample_rate
+    if file_format == "opus":
+        opus_rates = [8000, 12000, 16000, 24000, 48000]
+        if target_rate > 48000:
+            target_rate = 48000
+        elif target_rate not in opus_rates:
+            for rate in opus_rates:
+                if rate > target_rate:
+                    target_rate = rate
+                    break
+            if target_rate not in opus_rates:
+                target_rate = 48000
+
+        if target_rate != sample_rate:
+            if not TORCHAUDIO_AVAILABLE:
+                raise RuntimeError("HTNodes: 当前环境缺少 torchaudio，无法对 Opus 输出进行重采样。")
+            waveform = torchaudio.functional.resample(waveform, sample_rate, target_rate)
+
+    output_buffer = BytesIO()
+    container = av.open(output_buffer, mode="w", format=file_format)
+    for key, value in metadata.items():
+        container.metadata[key] = value
+
+    layout = "mono" if waveform.shape[0] == 1 else "stereo"
+    if file_format == "opus":
+        stream = container.add_stream("libopus", rate=target_rate, layout=layout)
+        bit_rate_map = {
+            "64k": 64000,
+            "96k": 96000,
+            "128k": 128000,
+            "192k": 192000,
+            "320k": 320000,
+        }
+        if quality in bit_rate_map:
+            stream.bit_rate = bit_rate_map[quality]
+    elif file_format == "mp3":
+        stream = container.add_stream("libmp3lame", rate=target_rate, layout=layout)
+        if quality == "V0":
+            stream.codec_context.qscale = 1
+        elif quality == "128k":
+            stream.bit_rate = 128000
+        elif quality == "320k":
+            stream.bit_rate = 320000
+    else:
+        stream = container.add_stream("flac", rate=target_rate, layout=layout)
+
+    frame = av.AudioFrame.from_ndarray(
+        waveform.movedim(0, 1).reshape(1, -1).float().numpy(),
+        format="flt",
+        layout=layout,
+    )
+    frame.sample_rate = target_rate
+    frame.pts = 0
+
+    container.mux(stream.encode(frame))
+    container.mux(stream.encode(None))
+    container.close()
+
+    output_buffer.seek(0)
+    with open(full_path, "wb") as file:
+        file.write(output_buffer.getbuffer())
+
+
+def get_video_container_options() -> list[str]:
+    if Types is not None:
+        return Types.VideoContainer.as_input()
+    return ["auto", "mp4"]
+
+
+def get_video_codec_options() -> list[str]:
+    if Types is not None:
+        return Types.VideoCodec.as_input()
+    return ["auto", "h264"]
+
+
+def get_video_extension(video_format: str) -> str:
+    if Types is not None:
+        return f".{Types.VideoContainer.get_extension(video_format)}"
+    return ".mp4"

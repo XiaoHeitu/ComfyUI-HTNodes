@@ -9,12 +9,16 @@
 - `HT 从文件加载图像`
 - `HT 从文件加载文本`
 - `HT 从文件加载 Latent`
+- `HT 从文件加载音频`
+- `HT 从文件加载视频`
 
 ### `HTNodes/Savers`
 
 - `HT 保存图像到文件`
 - `HT 保存文本到文件`
 - `HT 保存 Latent 到文件`
+- `HT 保存音频到文件`
+- `HT 保存视频到文件`
 
 ## 节点说明
 
@@ -85,6 +89,61 @@
   - 保存格式对齐 ComfyUI 官方 latent 保存方式
   - 如果存在 `noise_mask`，也会一起写入
 
+### 7. HT 从文件加载音频
+
+- 输入：`path` (`STRING`)
+- 输出：`audio` (`AUDIO`)
+- 说明：
+  - 通过任意字符串路径加载音频文件
+  - 输出结构对齐 ComfyUI 官方 `LoadAudio`
+  - 支持 ComfyUI / FFmpeg 可解码的常见音频格式，也可从带音轨的视频中提取音频
+
+### 8. HT 从文件加载视频
+
+- 输入：`path` (`STRING`)
+- 输出：`video` (`VIDEO`)
+- 说明：
+  - 通过任意字符串路径加载视频文件
+  - 输出类型对齐 ComfyUI 官方 `LoadVideo`
+  - 内部通过 ComfyUI 官方 `VideoFromFile` 读取
+
+### 9. HT 保存音频到文件
+
+- 输入：
+  - `audio` (`AUDIO`)
+  - `directory` (`STRING`)
+  - `filename` (`STRING`)
+  - `format` (`flac` / `mp3` / `opus`)
+  - `mp3_quality` (`V0` / `128k` / `320k`)
+  - `opus_quality` (`64k` / `96k` / `128k` / `192k` / `320k`)
+  - `allow_overwrite` (`BOOLEAN`)
+- 输出：`audio` (`AUDIO`)
+- 说明：
+  - 按“目录 + 文件名”的方式保存音频
+  - 格式和质量选项对齐 ComfyUI 官方 `Save Audio (Advanced)`
+  - `format=mp3` 时使用 `mp3_quality`
+  - `format=opus` 时使用 `opus_quality`
+  - `format=flac` 时忽略质量选项
+  - 如果输入是 batch 音频，会按批次编号分别保存
+
+### 10. HT 保存视频到文件
+
+- 输入：
+  - `video` (`VIDEO`)
+  - `directory` (`STRING`)
+  - `filename` (`STRING`)
+  - `format` (`auto` / `mp4`)
+  - `codec` (`auto` / `h264`)
+  - `encoding_mode` (`auto` / `re-encode`)
+  - `crf` (`FLOAT`)
+  - `allow_overwrite` (`BOOLEAN`)
+- 输出：`video` (`VIDEO`)
+- 说明：
+  - 按“目录 + 文件名”的方式保存视频
+  - 格式与编码选项对齐 ComfyUI 官方 `SaveVideo`
+  - 当 `codec=h264` 且 `encoding_mode=re-encode` 时，会使用 `crf`
+  - 其他情况下会尽量保持官方自动复用/自动转码行为
+
 ## 路径与命名规则
 
 所有保存节点都遵循下面这套规则：
@@ -112,6 +171,18 @@ Latent 会保存为：
 
 ```text
 <ComfyUI output>/my_outputs/test/demo_file.latent
+```
+
+音频会保存为：
+
+```text
+<ComfyUI output>/my_outputs/test/demo_file.flac
+```
+
+视频会保存为：
+
+```text
+<ComfyUI output>/my_outputs/test/demo_file.mp4
 ```
 
 ## 允许覆盖规则
@@ -180,6 +251,7 @@ ComfyUI-HTNodes/
 - 加载节点适合与路径拼接、文本生成、批处理类节点联动使用
 - 保存节点适合在流程中直接把结果落盘到固定位置
 - `Latent` 节点更适合读取和保存 ComfyUI 官方导出的 latent 文件
+- 音频/视频节点尽量复用 ComfyUI 官方媒体读写行为，适合与原版 `AUDIO` / `VIDEO` 工作流直接互通
 - 对于来源不明的 `.pt/.pth/.ckpt` 文件，建议先确认文件来源可信
 
 ## 后续可扩展方向
